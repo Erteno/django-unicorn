@@ -3,6 +3,8 @@ import pytest
 from django_unicorn.components import UnicornView
 from django_unicorn.db import DbModel
 from django_unicorn.decorators import db_model
+from django_unicorn.errors import UnicornCacheError
+from django_unicorn.utils import get_cacheable_component
 from example.coffee.models import Flavor
 
 
@@ -36,19 +38,19 @@ def test_happy_path(component):
 @pytest.mark.django_db
 def test_missing_name(component):
     with pytest.raises(AssertionError):
-        component.get_pk({"pk": 1})
+        component.get_pk({"pk": 1}, 1)
 
 
 @pytest.mark.django_db
 def test_missing_pk(component):
     with pytest.raises(AssertionError):
-        component.get_pk({"name": "flavor"})
+        component.get_pk({"name": "flavor"}, 1)
 
 
 @pytest.mark.django_db
 def test_model_not_found(component):
     with pytest.raises(Flavor.DoesNotExist):
-        component.get_pk({"name": "flavor", "pk": -99})
+        component.get_pk({"name": "flavor", "pk": -99}, 1)
 
 
 @pytest.mark.django_db
@@ -78,3 +80,12 @@ def test_missing_db_models():
 
     with pytest.raises(AssertionError):
         component.get_pk({"name": "flavor", "pk": -99})
+
+
+@pytest.mark.django_db
+def test_component_db_model_is_pickleable(component):
+    """
+    Using the `wrapt` library would raise an exception, but the `decorator` library
+    is pickleable, so this should be a-ok
+    """
+    get_cacheable_component(component)

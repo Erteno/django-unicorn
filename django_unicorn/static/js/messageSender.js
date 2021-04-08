@@ -1,4 +1,4 @@
-import { getCsrfToken, hasValue, isFunction } from "./utils.js";
+import { $, getCsrfToken, hasValue, isFunction } from "./utils.js";
 import { MORPHDOM_OPTIONS } from "./morphdom/2.6.1/options.js";
 
 /**
@@ -30,6 +30,8 @@ export function send(component, callback) {
     data: component.data,
     checksum: component.checksum,
     actionQueue: component.currentActionQueue,
+    epoch: Date.now(),
+    hash: component.hash,
   };
 
   const headers = {
@@ -48,12 +50,22 @@ export function send(component, callback) {
         return response.json();
       }
 
+      // HTTP status code of 304 is `Not Modified`. This null gets caught in the next promise
+      // and stops any more processing.
+      if (response.status === 304) {
+        return null;
+      }
+
       throw Error(
         `Error when getting response: ${response.statusText} (${response.status})`
       );
     })
     .then((responseJson) => {
       if (!responseJson) {
+        return;
+      }
+
+      if (responseJson.queued && responseJson.queued === true) {
         return;
       }
 
@@ -98,13 +110,19 @@ export function send(component, callback) {
         element.handleDirty(true);
       });
 
-      // Get the data from the response
-      component.data = responseJson.data || {};
+      // Merge the data from the response into the component's data
+      Object.keys(responseJson.data || {}).forEach((key) => {
+        component.data[key] = responseJson.data[key];
+      });
+
       component.errors = responseJson.errors || {};
       component.return = responseJson.return || {};
+      component.hash = responseJson.hash;
 
       const parent = responseJson.parent || {};
-      const rerenderedComponent = responseJson.dom;
+      const rerenderedComponent = responseJson.dom || {};
+      const partials = responseJson.partials || [];
+      const { checksum } = responseJson;
 
       // Handle poll
       const poll = responseJson.poll || {};
@@ -126,27 +144,76 @@ export function send(component, callback) {
       }
 
       // Refresh the parent component if there is one
-      if (hasValue(parent) && hasValue(parent.id) && hasValue(parent.dom)) {
+      if (hasValue(parent) && hasValue(parent.id)) {
         const parentComponent = component.getParentComponent(parent.id);
 
         if (parentComponent && parentComponent.id === parent.id) {
-          // TODO: Handle errors?
-          parentComponent.data = parent.data || {};
+          // TODO: Handle parent errors?
 
-          component.morphdom(
-            parentComponent.root,
-            parent.dom,
-            MORPHDOM_OPTIONS
-          );
-          parentComponent.refreshChecksum();
+          if (hasValue(parent.data)) {
+            parentComponent.data = parent.data;
+          }
 
-          // parentComponent.getChildrenComponents().forEach((child) => {
-          //   child.refreshEventListeners();
-          // });
+          if (parent.dom) {
+            component.morphdom(
+              parentComponent.root,
+              parent.dom,
+              MORPHDOM_OPTIONS
+            );
+          }
+
+          if (parent.checksum) {
+            parentComponent.root.setAttribute(
+              "unicorn:checksum",
+              parent.checksum
+            );
+            parentComponent.refreshChecksum();
+          }
+
+          parentComponent.refreshEventListeners();
+
+          parentComponent.getChildrenComponents().forEach((child) => {
+            child.init();
+            child.refreshEventListeners();
+          });
         }
       }
 
-      component.morphdom(component.root, rerenderedComponent, MORPHDOM_OPTIONS);
+      if (partials.length > 0) {
+        for (let i = 0; i < partials.length; i++) {
+          const partial = partials[i];
+          let targetDom = null;
+
+          if (partial.key) {
+            targetDom = $(`[unicorn\\:key="${partial.key}"]`, component.root);
+          } else if (partial.id) {
+            targetDom = $(`#${partial.id}`, component.root);
+          }
+
+          if (!targetDom && component.root.parentElement) {
+            // Go up one parent if the target can't be found
+            targetDom = $(
+              `[unicorn\\:key="${partial.key}"]`,
+              component.root.parentElement
+            );
+          }
+
+          if (targetDom) {
+            component.morphdom(targetDom, partial.dom, MORPHDOM_OPTIONS);
+          }
+        }
+
+        if (checksum) {
+          component.root.setAttribute("unicorn:checksum", checksum);
+          component.refreshChecksum();
+        }
+      } else {
+        component.morphdom(
+          component.root,
+          rerenderedComponent,
+          MORPHDOM_OPTIONS
+        );
+      }
 
       // Re-init to refresh the root and checksum based on the new data
       component.init();
@@ -163,6 +230,9 @@ export function send(component, callback) {
           }
         });
       });
+
+      // Call any JavaScript functions from the response
+      component.callCalls(responseJson.calls);
 
       const triggeringElements = component.lastTriggeringElements;
       component.lastTriggeringElements = [];

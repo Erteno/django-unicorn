@@ -102,6 +102,8 @@ export function addActionEventListener(component, eventType) {
     let targetElement = new Element(event.target);
 
     // Make sure that the target element is a unicorn element.
+    // Handles events fired from an element inside a unicorn element
+    // e.g. <button u:click="click"><span>Click!</span></button>
     if (targetElement && !targetElement.isUnicorn) {
       targetElement = targetElement.getUnicornParent();
     }
@@ -115,9 +117,7 @@ export function addActionEventListener(component, eventType) {
         const { action } = actionEvent;
         const { element } = actionEvent;
 
-        // TOD: Check why the targetElement needs to check isSameNode OR has the same
-        // key/id since `isSameNode` won't always work
-        if (targetElement.isSame(element) || targetElement.isSameId(element)) {
+        if (targetElement.isSame(element)) {
           // Add the value of any child element of the target that is a lazy model to the action queue
           // Handles situations similar to https://github.com/livewire/livewire/issues/528
           component.walker(element.el, (childEl) => {
@@ -138,6 +138,7 @@ export function addActionEventListener(component, eventType) {
               }
             });
 
+            // Add the value of any child element of the target that is a lazy db to the action queue
             const dbElsInTargetScope = component.dbEls.filter((e) =>
               e.el.isSameNode(childEl)
             );
@@ -238,11 +239,11 @@ export function addActionEventListener(component, eventType) {
           if (action.key) {
             if (action.key === toKebabCase(event.key)) {
               handleLoading(component, targetElement);
-              component.callMethod(action.name);
+              component.callMethod(action.name, targetElement.partial);
             }
           } else {
             handleLoading(component, targetElement);
-            component.callMethod(action.name);
+            component.callMethod(action.name, targetElement.partial);
           }
         }
       });
@@ -290,6 +291,7 @@ export function addModelEventListener(component, element, eventType) {
         name: element.model.name,
         value: element.getValue(),
       },
+      partial: element.partial,
     };
 
     if (!component.lastTriggeringElements.some((e) => e.isSame(element))) {
@@ -356,26 +358,31 @@ export function addDbEventListener(component, element, eventType) {
   const { el } = element;
 
   el.addEventListener(eventType, (event) => {
-    if (
-      (isEmpty(element.db.name) && isEmpty(element.model.name)) ||
-      isEmpty(element.db.pk)
-    ) {
+    if (isEmpty(element.db.name) && isEmpty(element.model.name)) {
       return;
     }
 
     let isDirty = false;
 
-    for (let i = 0; i < component.data[element.model.name].length; i++) {
-      const dbModel = component.data[element.model.name][i];
+    if (
+      hasValue(element.model.name) &&
+      Object.prototype.hasOwnProperty.call(component.data, element.model.name)
+    ) {
+      for (let i = 0; i < component.data[element.model.name].length; i++) {
+        const dbModel = component.data[element.model.name][i];
 
-      if (dbModel.pk.toString() === element.db.pk) {
-        if (dbModel[element.field.name] !== element.getValue()) {
-          element.handleDirty();
-          isDirty = true;
-        } else {
-          element.handleDirty(true);
+        if (dbModel.pk.toString() === element.db.pk) {
+          if (dbModel[element.field.name] !== element.getValue()) {
+            element.handleDirty();
+            isDirty = true;
+          } else {
+            element.handleDirty(true);
+          }
         }
       }
+    } else {
+      // If the data can't be found consider it always dirty since it's new
+      isDirty = true;
     }
 
     if (element.field.isLazy) {
@@ -401,6 +408,7 @@ export function addDbEventListener(component, element, eventType) {
         db: element.db,
         fields: {},
       },
+      partial: element.partial,
     };
 
     action.payload.fields[element.field.name] = element.getValue();

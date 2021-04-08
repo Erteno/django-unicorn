@@ -1,22 +1,26 @@
-from django.db.models import SET_NULL, ForeignKey, Model
-from django.db.models.fields import CharField
+import json
+from decimal import Decimal
+
+from django.db import models
+from django.utils.timezone import now
 
 import pytest
 
 from django_unicorn import serializer
+from django_unicorn.utils import dicts_equal
 from example.coffee.models import Flavor
 
 
-class SimpleTestModel(Model):
-    name = CharField(max_length=10)
+class SimpleTestModel(models.Model):
+    name = models.CharField(max_length=10)
 
     class Meta:
         app_label = "tests"
 
 
-class ComplicatedTestModel(Model):
-    name = CharField(max_length=10)
-    parent = ForeignKey("self", blank=True, null=True, on_delete=SET_NULL)
+class ComplicatedTestModel(models.Model):
+    name = models.CharField(max_length=10)
+    parent = models.ForeignKey("self", blank=True, null=True, on_delete=models.SET_NULL)
 
     class Meta:
         app_label = "tests"
@@ -25,6 +29,13 @@ class ComplicatedTestModel(Model):
 def test_int():
     expected = '{"name":123}'
     actual = serializer.dumps({"name": 123})
+
+    assert expected == actual
+
+
+def test_decimal():
+    expected = '{"name":"123.1"}'
+    actual = serializer.dumps({"name": Decimal("123.1")})
 
     assert expected == actual
 
@@ -52,6 +63,102 @@ def test_simple_model():
     assert expected == actual
 
 
+def test_model_with_datetime(db):
+    datetime = now()
+    flavor = Flavor(name="name1", datetime=datetime)
+
+    expected = {
+        "flavor": {
+            "name": "name1",
+            "label": "",
+            "parent": None,
+            "float_value": None,
+            "decimal_value": None,
+            "uuid": str(flavor.uuid),
+            "date": None,
+            "datetime": datetime.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3],
+            "time": None,
+            "duration": None,
+            "pk": None,
+        }
+    }
+
+    actual = serializer.dumps({"flavor": flavor})
+    assert dicts_equal(expected, json.loads(actual))
+
+
+def test_model_with_datetime_as_string(db):
+    datetime = now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    flavor = Flavor(name="name1", datetime=datetime)
+
+    expected = {
+        "flavor": {
+            "name": "name1",
+            "label": "",
+            "parent": None,
+            "float_value": None,
+            "decimal_value": None,
+            "uuid": str(flavor.uuid),
+            "date": None,
+            "datetime": datetime,
+            "time": None,
+            "duration": None,
+            "pk": None,
+        }
+    }
+
+    actual = serializer.dumps({"flavor": flavor})
+    assert dicts_equal(expected, json.loads(actual))
+
+
+def test_model_with_time_as_string(db):
+    time = now().strftime("%H:%M:%S.%f")[:-3]
+    flavor = Flavor(name="name1", time=time)
+
+    expected = {
+        "flavor": {
+            "name": "name1",
+            "label": "",
+            "parent": None,
+            "float_value": None,
+            "decimal_value": None,
+            "uuid": str(flavor.uuid),
+            "date": None,
+            "datetime": None,
+            "time": time,
+            "duration": None,
+            "pk": None,
+        }
+    }
+
+    actual = serializer.dumps({"flavor": flavor})
+    assert dicts_equal(expected, json.loads(actual))
+
+
+def test_model_with_duration_as_string(db):
+    duration = "-1 day, 19:00:00"
+    flavor = Flavor(name="name1", duration=duration)
+
+    expected = {
+        "flavor": {
+            "name": "name1",
+            "label": "",
+            "parent": None,
+            "float_value": None,
+            "decimal_value": None,
+            "uuid": str(flavor.uuid),
+            "date": None,
+            "datetime": None,
+            "time": None,
+            "duration": "-1 19:00:00",
+            "pk": None,
+        }
+    }
+
+    actual = serializer.dumps({"flavor": flavor})
+    assert dicts_equal(expected, json.loads(actual))
+
+
 def test_model_foreign_key():
     test_model_one = ComplicatedTestModel(id=1, name="abc")
     test_model_two = ComplicatedTestModel(id=2, name="def", parent=test_model_one)
@@ -62,7 +169,7 @@ def test_model_foreign_key():
     assert expected == actual
 
 
-def test_model_foreign_key_recurive_parents():
+def test_model_foreign_key_recursive_parent():
     test_model_one = ComplicatedTestModel(id=1, name="abc")
     test_model_two = ComplicatedTestModel(id=2, name="def", parent=test_model_one)
     test_model_one.parent = test_model_two
@@ -83,10 +190,39 @@ def test_dumps_queryset(db):
 
     flavors = Flavor.objects.all()
 
-    expected = '{"flavors":[{"name":"name1","label":"label1","parent":null,"float_value":null,"decimal_value":null,"pk":1},{"name":"name2","label":"label2","parent":1,"float_value":null,"decimal_value":null,"pk":2}]}'
-    actual = serializer.dumps({"flavors": flavors})
+    expected_data = {
+        "flavors": [
+            {
+                "name": "name1",
+                "label": "label1",
+                "parent": None,
+                "float_value": None,
+                "decimal_value": None,
+                "uuid": str(flavor_one.uuid),
+                "date": None,
+                "datetime": None,
+                "time": None,
+                "duration": None,
+                "pk": 1,
+            },
+            {
+                "name": "name2",
+                "label": "label2",
+                "parent": 1,
+                "float_value": None,
+                "decimal_value": None,
+                "uuid": str(flavor_two.uuid),
+                "date": None,
+                "datetime": None,
+                "time": None,
+                "duration": None,
+                "pk": 2,
+            },
+        ]
+    }
 
-    assert expected == actual
+    actual = serializer.dumps({"flavors": flavors})
+    assert expected_data == json.loads(actual)
 
 
 def test_get_model_dict():
@@ -100,6 +236,11 @@ def test_get_model_dict():
         "parent": None,
         "decimal_value": None,
         "float_value": None,
+        "uuid": str(flavor_one.uuid),
+        "date": None,
+        "datetime": None,
+        "time": None,
+        "duration": None,
     }
 
     assert expected == actual

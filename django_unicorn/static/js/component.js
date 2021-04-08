@@ -8,7 +8,7 @@ import {
 import { components } from "./store.js";
 import { send } from "./messageSender.js";
 import morphdom from "./morphdom/2.6.1/morphdom.js";
-import { $, contains, hasValue, isEmpty, isFunction, walk } from "./utils.js";
+import { $, hasValue, isEmpty, isFunction, walk } from "./utils.js";
 
 /**
  * Encapsulate component.
@@ -20,13 +20,8 @@ export class Component {
     this.key = args.key;
     this.messageUrl = args.messageUrl;
     this.csrfTokenHeaderName = args.csrfTokenHeaderName;
-
-    if (contains(this.name, ".")) {
-      const names = this.name.split(".");
-      this.name = names[names.length - 2];
-    }
-
-    this.data = args.data;
+    this.hash = args.hash;
+    this.data = args.data || {};
     this.syncUrl = `${this.messageUrl}/${this.name}`;
 
     this.document = args.document || document;
@@ -55,6 +50,8 @@ export class Component {
     this.init();
     this.refreshEventListeners();
     this.initPolling();
+
+    this.callCalls(args.calls);
   }
 
   /**
@@ -120,6 +117,45 @@ export class Component {
   }
 
   /**
+   * Call JavaScript functions on the `window`.
+   * @param {Array} calls A list of objects that specify the methods to call.
+   *
+   * `calls`: [{"fn": "someFunctionName"},]
+   * `calls`: [{"fn": "someFunctionName", args: ["world"]},]
+   * `calls`: [{"fn": "SomeModule.someFunctionName"},]
+   * `calls`: [{"fn": "SomeModule.someFunctionName", args: ["world", "universe"]},]
+   *
+   * Returns:
+   * Array of results for each method call.
+   */
+  callCalls(calls) {
+    calls = calls || [];
+    const results = [];
+
+    calls.forEach((call) => {
+      let functionName = call.fn;
+      let module = this.window;
+
+      call.fn.split(".").forEach((obj, idx) => {
+        // only traverse down modules to the first dot, because the last portion is the function name
+        if (idx < call.fn.split(".").length - 1) {
+          module = module[obj];
+          // account for the period when slicing
+          functionName = functionName.slice(obj.length + 1);
+        }
+      });
+
+      if (call.args) {
+        results.push(module[functionName](...call.args));
+      } else {
+        results.push(module[functionName]());
+      }
+    });
+
+    return results;
+  }
+
+  /**
    * Sets event listeners on unicorn elements.
    */
   refreshEventListeners() {
@@ -141,10 +177,7 @@ export class Component {
         const element = new Element(el);
 
         if (element.isUnicorn) {
-          if (
-            hasValue(element.field) &&
-            (hasValue(element.db) || hasValue(element.model))
-          ) {
+          if (hasValue(element.field) && hasValue(element.db)) {
             if (!this.attachedDbEvents.some((e) => e.isSame(element))) {
               this.attachedDbEvents.push(element);
               addDbEventListener(this, element);
@@ -216,14 +249,16 @@ export class Component {
   /**
    * Calls the method for a particular component.
    */
-  callMethod(methodName, errCallback) {
+  callMethod(methodName, partial, errCallback) {
     const action = {
       type: "callMethod",
       payload: { name: methodName },
+      partial,
     };
     this.actionQueue.push(action);
 
-    this.queueMessage(-1, (triggeringElements, _, err) => {
+    // No debounce timeout for action methods to remove any perceived lag
+    this.queueMessage(0, (triggeringElements, _, err) => {
       if (err && isFunction(errCallback)) {
         errCallback(err);
       } else if (err) {
@@ -244,10 +279,35 @@ export class Component {
   handlePollError(err) {
     if (err) {
       console.error(err);
-    }
-    if (this.poll.timer) {
+    } else if (this.poll.timer) {
       clearInterval(this.poll.timer);
     }
+  }
+
+  /**
+   * Check to see if the poll is disabled.
+   */
+  isPollEnabled() {
+    if (!this.poll.disable) {
+      if (hasValue(this.poll.disableData)) {
+        if (this.poll.disableData.startsWith("!")) {
+          // Manually negate this and re-negate it after the check
+          this.poll.disableData = this.poll.disableData.slice(1);
+
+          if (this.data[this.poll.disableData]) {
+            return true;
+          }
+
+          this.poll.disableData = `!${this.poll.disableData}`;
+        } else if (!this.data[this.poll.disableData]) {
+          return true;
+        }
+      } else {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -274,8 +334,17 @@ export class Component {
         false
       );
 
-      // Call the method once before the timer starts
-      this.callMethod(this.poll.method, this.handlePollError);
+      this.poll.partial = rootElement.partial;
+
+      if (this.isPollEnabled()) {
+        // Call the method once before the timer starts
+        this.callMethod(
+          this.poll.method,
+          this.poll.partial,
+          this.handlePollError
+        );
+      }
+
       this.startPolling();
     }
   }
@@ -285,23 +354,12 @@ export class Component {
    */
   startPolling() {
     this.poll.timer = setInterval(() => {
-      if (!this.poll.disable) {
-        if (hasValue(this.poll.disableData)) {
-          if (this.poll.disableData.startsWith("!")) {
-            // Manually negate this and re-negate it after the check
-            this.poll.disableData = this.poll.disableData.slice(1);
-
-            if (this.data[this.poll.disableData]) {
-              this.callMethod(this.poll.method, this.handlePollError);
-            }
-
-            this.poll.disableData = `!${this.poll.disableData}`;
-          } else if (!this.data[this.poll.disableData]) {
-            this.callMethod(this.poll.method, this.handlePollError);
-          }
-        } else {
-          this.callMethod(this.poll.method, this.handlePollError);
-        }
+      if (this.isPollEnabled()) {
+        this.callMethod(
+          this.poll.method,
+          this.poll.partial,
+          this.handlePollError
+        );
       }
     }, this.poll.timing);
   }
@@ -360,15 +418,19 @@ export class Component {
    */
   setDbModelValues() {
     this.dbEls.forEach((element) => {
-      if (element.db.pk === "") {
+      if (isEmpty(element.db.pk)) {
         // Empty string for the PK implies that the model is not associated to an actual model instance
         element.setValue("");
       } else {
-        if (isEmpty(element.model.name)) {
-          throw Error("Setting a field value requires a model to be set");
+        const dbName = element.db.name || element.model.name;
+
+        if (isEmpty(dbName)) {
+          throw Error(
+            "Setting a field value requires a db or model name to be set"
+          );
         }
 
-        let datas = this.data[element.model.name];
+        let datas = this.data[dbName];
 
         // Force the data to be an array if it isn't already for the next step
         if (!Array.isArray(datas)) {
@@ -377,7 +439,7 @@ export class Component {
 
         datas.forEach((model) => {
           // Convert the model's pk to a string because it will always be a string on the element
-          if (hasValue(model.pk)) {
+          if (hasValue(model) && hasValue(model.pk)) {
             if (model.pk.toString() === element.db.pk) {
               element.setValue(model[element.field.name]);
             }

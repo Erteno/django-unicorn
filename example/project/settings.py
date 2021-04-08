@@ -14,6 +14,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    # Internal apps
     "books",
     "coffee",
     "www",
@@ -57,6 +58,18 @@ ASGI_APPLICATION = (
 )
 
 
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "unique-snowflake",
+    }
+}
+# CACHES["default"] = {
+#     "BACKEND": "django_redis.cache.RedisCache",
+#     "LOCATION": "redis://localhost:6379",
+#     "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
+# }
+
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
@@ -84,6 +97,9 @@ USE_TZ = True
 
 STATIC_URL = "/static/"
 STATICFILES_DIRS = (os.path.join(BASE_DIR, "static"),)
+
+
+UNICORN = {"SERIAL": {"ENABLED": True, "TIMEOUT": 5,}, "CACHE_ALIAS": "default"}
 
 
 LOGGING = {

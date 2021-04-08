@@ -6,9 +6,6 @@ from django.conf import settings
 import shortuuid
 
 from django_unicorn.call_method_parser import InvalidKwarg, parse_kwarg
-from django_unicorn.errors import UnicornViewError
-
-from ..settings import get_setting
 
 
 register = template.Library()
@@ -16,6 +13,16 @@ register = template.Library()
 
 @register.inclusion_tag("unicorn/scripts.html")
 def unicorn_scripts():
+    # Import here to prevent the potential of this from loading before Django settings
+    from django_unicorn.settings import get_setting
+
+    csrf_header_name = settings.CSRF_HEADER_NAME
+
+    if csrf_header_name.startswith("HTTP_"):
+        csrf_header_name = settings.CSRF_HEADER_NAME[5:]
+
+    csrf_header_name = csrf_header_name.replace("_", "-")
+
     return {
         "MINIFIED": get_setting("MINIFIED", not settings.DEBUG),
         "IS_ASGI": hasattr(settings, "ASGI_APPLICATION")
@@ -24,6 +31,7 @@ def unicorn_scripts():
             not hasattr(settings, "WSGI_APPLICATION")
             or not bool(settings.WSGI_APPLICATION)
         ),
+        "CSRF_HEADER_NAME": csrf_header_name,
     }
 
 

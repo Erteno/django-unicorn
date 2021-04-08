@@ -2,112 +2,39 @@ import importlib
 import inspect
 import logging
 import pickle
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+import sys
+from typing import Any, Callable, Dict, List, Optional, Sequence, Type, Union
 
+from django.core.cache import caches
 from django.core.exceptions import ImproperlyConfigured
 from django.db.models import Model
 from django.http import HttpRequest
-from django.http.response import HttpResponseRedirect
-from django.template.response import TemplateResponse
-from django.utils.safestring import mark_safe
 from django.views.generic.base import TemplateView
 
-import orjson
-from bs4 import BeautifulSoup
-from bs4.element import Tag
-from bs4.formatter import HTMLFormatter
 from cachetools.lru import LRUCache
 
-from . import serializer
-from .decorators import timed
-from .settings import get_setting
-from .utils import generate_checksum
+from django_unicorn.settings import get_cache_alias
+
+from .. import serializer
+from ..decorators import timed
+from ..errors import ComponentLoadError, UnicornCacheError
+from ..settings import get_setting
+from ..utils import get_cacheable_component
+from .fields import UnicornField
+from .unicorn_template_response import UnicornTemplateResponse
 
 
 logger = logging.getLogger(__name__)
 
 
-# Module cache to reduce initialization costs
+# TODO: Make maxsize configurable
+# Module cache to store the found component classes
+views_cache = LRUCache(maxsize=100)
+
+# Module cache for constructed component classes
+# This can create a subtle race condition so a more long-term solution needs to be found
 constructed_views_cache = LRUCache(maxsize=100)
-
-
-class UnicornField:
-    """
-    Base class to provide a way to serialize a component field quickly.
-    """
-
-    def to_json(self):
-        return self.__dict__
-
-
-class Update:
-    """
-    Base class for updaters.
-    """
-
-    def to_json(self):
-        return self.__dict__
-
-
-class HashUpdate(Update):
-    """
-    Updates the current URL hash from an action method.
-    """
-
-    def __init__(self, hash: str):
-        """
-        Args:
-            param hash: The hash to change. Example: `#model-123`.
-        """
-        self.hash = hash
-
-
-class LocationUpdate(Update):
-    """
-    Updates the current URL from an action method.
-    """
-
-    def __init__(self, redirect: HttpResponseRedirect, title: str = None):
-        """
-        Args:
-            param redirect: The redirect that contains the URL to redirect to.
-            param title: The new title of the page. Optional.
-        """
-        self.redirect = redirect
-        self.title = title
-
-
-class PollUpdate(Update):
-    """
-    Updates the current poll from an action method.
-    """
-
-    def __init__(self, timing: int = None, method: str = None, disable: bool = False):
-        """
-        Args:
-            param timing: The timing that should be used for the poll. Optional. Defaults to `None`
-                which keeps the existing timing.
-            param method: The method that should be used for the poll. Optional. Defaults to `None`
-                which keeps the existing method.
-            param disable: Whether to disable the poll or not not. Optional. Defaults to `False`.
-        """
-        self.timing = timing
-        self.method = method
-        self.disable = disable
-
-
-class ComponentLoadError(Exception):
-    pass
-
-
-class UnsortedAttributes(HTMLFormatter):
-    """
-    Prevent beautifulsoup from re-ordering attributes.
-    """
-
-    def attributes(self, tag: Tag):
-        for k, v in tag.attrs.items():
-            yield k, v
+COMPONENTS_MODULE_CACHE_ENABLED = "pytest" not in sys.modules
 
 
 def convert_to_snake_case(s: str) -> str:
@@ -115,102 +42,89 @@ def convert_to_snake_case(s: str) -> str:
     return s.replace("-", "_")
 
 
-def convert_to_camel_case(s: str) -> str:
-    # TODO: Better handling of dash/snake->camel-case
+def convert_to_pascal_case(s: str) -> str:
+    # TODO: Better handling of dash/snake->pascal-case
     s = convert_to_snake_case(s)
     return "".join(word.title() for word in s.split("_"))
 
 
-class UnicornTemplateResponse(TemplateResponse):
-    def __init__(
-        self,
-        template,
-        request,
-        context=None,
-        content_type=None,
-        status=None,
-        charset=None,
-        using=None,
-        component=None,
-        init_js=False,
+def get_locations(component_name):
+    # TODO: django.conf setting bool that defines whether to look in all installed apps for components
+    locations = []
+
+    if "." in component_name:
+        # Handle component names that specify a folder structure
+        component_name = component_name.replace("/", ".")
+
+        # Handle fully-qualified component names (e.g. `project.unicorn.HelloWorldView`)
+        class_name = component_name.split(".")[-1:][0]
+        module_name = component_name.replace("." + class_name, "")
+        locations.append((class_name, module_name))
+
+        # Assume if it ends with "View", then we don't need to add other
+        if component_name.endswith("View") or component_name.endswith("Component"):
+            return locations
+
+    # Handle component names that specify a folder structure
+    component_name = component_name.replace("/", ".")
+
+    # Use conventions to find the component class
+    class_name = convert_to_pascal_case(component_name)
+
+    if "." in class_name:
+        if class_name.split(".")[-1:]:
+            class_name = class_name.split(".")[-1:][0]
+
+    class_name = f"{class_name}View"
+    module_name = convert_to_snake_case(component_name)
+
+    unicorn_apps = get_setting("APPS", ["unicorn"])
+
+    assert (
+        isinstance(unicorn_apps, list)
+        or isinstance(unicorn_apps, tuple)
+        or isinstance(unicorn_apps, set)
+    ), "APPS is expected to be a list, tuple or set"
+
+    for app in unicorn_apps:
+        app_module_name = f"{app}.components.{module_name}"
+        locations.append((class_name, app_module_name))
+
+    return locations
+
+
+@timed
+def construct_component(
+    component_class,
+    component_id,
+    component_name,
+    component_key,
+    parent,
+    request,
+    **kwargs,
+):
+    """
+    Constructs a class instance.
+    """
+    component = component_class(
+        component_id=component_id,
+        component_name=component_name,
+        component_key=component_key,
+        parent=parent,
+        request=request,
         **kwargs,
-    ):
-        super().__init__(
-            template=template,
-            request=request,
-            context=context,
-            content_type=content_type,
-            status=status,
-            charset=charset,
-            using=using,
-        )
+    )
 
-        self.component = component
-        self.init_js = init_js
+    component.calls = []
+    component.children = []
+    component._children_set = False
 
-    @timed
-    def render(self):
-        response = super().render()
+    component.mount()
+    component.hydrate()
+    component.complete()
+    component._validate_called = False
 
-        if not self.component or not self.component.component_id:
-            return response
-
-        content = response.content.decode("utf-8")
-
-        frontend_context_variables = self.component.get_frontend_context_variables()
-        frontend_context_variables_dict = orjson.loads(frontend_context_variables)
-        checksum = generate_checksum(orjson.dumps(frontend_context_variables_dict))
-
-        # Handle potential nested component name using dot-notation
-        nested_component_name = self.component.component_name.replace(".", "/")
-
-        soup = BeautifulSoup(content, features="html.parser")
-        root_element = UnicornTemplateResponse._get_root_element(soup)
-        root_element["unicorn:id"] = self.component.component_id
-        root_element["unicorn:name"] = nested_component_name
-        root_element["unicorn:key"] = self.component.component_key
-        root_element["unicorn:checksum"] = checksum
-
-        if self.init_js:
-            script_tag = soup.new_tag("script")
-            init = {
-                "id": self.component.component_id,
-                "name": nested_component_name,
-                "key": self.component.component_key,
-                "data": orjson.loads(frontend_context_variables),
-            }
-            init = orjson.dumps(init).decode("utf-8")
-            script_tag["type"] = "module"
-            script_tag.string = f"if (typeof Unicorn === 'undefined') {{ console.error('Unicorn is missing. Do you need {{% load unicorn %}} or {{% unicorn-scripts %}}?') }} else {{ Unicorn.componentInit({init}); }}"
-            root_element.insert_after(script_tag)
-
-        rendered_template = UnicornTemplateResponse._desoupify(soup)
-        rendered_template = mark_safe(rendered_template)
-
-        response.content = rendered_template
-
-        return response
-
-    @staticmethod
-    def _get_root_element(soup: BeautifulSoup) -> Tag:
-        """
-        Gets the first div element.
-
-        Returns:
-            BeautifulSoup element.
-            
-            Raises an Exception if a div cannot be found.
-        """
-        for element in soup.contents:
-            if element.name:
-                return element
-
-        raise Exception("No root element found")
-
-    @staticmethod
-    def _desoupify(soup):
-        soup.smooth()
-        return soup.encode(formatter=UnsortedAttributes()).decode("utf-8")
+    return component
 
 
 class UnicornView(TemplateView):
@@ -229,6 +143,9 @@ class UnicornView(TemplateView):
     # Dictionary with key: attribute name; value: pickled attribute value
     _resettable_attributes_cache: Dict[str, Any] = {}
 
+    # JavaScript method calls
+    calls = []
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
@@ -240,6 +157,7 @@ class UnicornView(TemplateView):
 
         assert hasattr(self, "component_id"), "Component id is required"
         assert self.component_id, "Component id is required"
+        self.component_cache_key = f"unicorn:component:{self.component_id}"
 
         if "request" in kwargs:
             self.setup(kwargs["request"])
@@ -247,6 +165,7 @@ class UnicornView(TemplateView):
         if "parent" in kwargs:
             self.parent = kwargs["parent"]
 
+        self._init_script: str = ""
         self._children_set = False
         self._validate_called = False
         self.errors = {}
@@ -304,15 +223,39 @@ class UnicornView(TemplateView):
                 )
                 pass
 
+    def call(self, function_name, *args):
+        """
+        Add a JavaScript method name and arguments to be called after the component is rendered.
+        """
+        self.calls.append({"fn": function_name, "args": args})
+
     def mount(self):
         """
-        Hook that gets called when a component is first created.
+        Hook that gets called when the component is first created.
         """
         pass
 
     def hydrate(self):
         """
-        Hook that gets called when a component's data is hydrated.
+        Hook that gets called when the component's data is hydrated.
+        """
+        pass
+
+    def complete(self):
+        """
+        Hook that gets called after all component methods are executed.
+        """
+        pass
+
+    def rendered(self, html):
+        """
+        Hook that gets called after the component has been rendered.
+        """
+        pass
+
+    def parent_rendered(self, html):
+        """
+        Hook that gets called after the component's parent has been rendered.
         """
         pass
 
@@ -382,6 +325,13 @@ class UnicornView(TemplateView):
         frontend_context_variables = {}
         attributes = self._attributes()
         frontend_context_variables.update(attributes)
+
+        # Remove any field in `javascript_exclude` from the `frontend_context_variables`
+        if hasattr(self, "Meta") and hasattr(self.Meta, "javascript_exclude"):
+            if isinstance(self.Meta.javascript_exclude, Sequence):
+                for field_name in self.Meta.javascript_exclude:
+                    if field_name in frontend_context_variables:
+                        del frontend_context_variables[field_name]
 
         # Add cleaned values to `frontend_content_variables` based on the widget in form's fields
         form = self._get_form(attributes)
@@ -542,10 +492,8 @@ class UnicornView(TemplateView):
 
             if hasattr(self, updated_function_name):
                 getattr(self, updated_function_name)(value)
-        except AttributeError:
-            logger.error(
-                f"'{name}' attribute on '{self.component_name}' component could not be set. Is it a @property without a setter?"
-            )
+        except AttributeError as e:
+            raise
 
     @timed
     def _methods(self) -> Dict[str, Callable]:
@@ -649,6 +597,9 @@ class UnicornView(TemplateView):
             "update",
             "calling",
             "called",
+            "complete",
+            "rendered",
+            "parent_rendered",
             "validate",
             "is_valid",
             "get_frontend_context_variables",
@@ -656,11 +607,15 @@ class UnicornView(TemplateView):
             "updated",
             "parent",
             "children",
+            "call",
+            "calls",
+            "component_cache_key",
         )
         excludes = []
 
         if hasattr(self, "Meta") and hasattr(self.Meta, "exclude"):
-            excludes = self.Meta.exclude
+            if isinstance(self.Meta.exclude, Sequence):
+                excludes = self.Meta.exclude
 
         return not (
             name.startswith("_")
@@ -676,8 +631,8 @@ class UnicornView(TemplateView):
         component_name: str,
         component_key: str = "",
         parent: "UnicornView" = None,
-        use_cache=True,
         request: HttpRequest = None,
+        use_cache=True,
         kwargs: Dict[str, Any] = {},
     ) -> "UnicornView":
         """
@@ -690,7 +645,6 @@ class UnicornView(TemplateView):
             param component_key: Key of the component to allow multiple components of the same name
                 to be differentiated. Optional.
             param parent: The parent component of the current component.
-            param use_cache: Get component from cache or force construction of component. Defaults to `True`.
             param kwargs: Keyword arguments for the component passed in from the template. Defaults to `{}`.
         
         Returns:
@@ -699,17 +653,6 @@ class UnicornView(TemplateView):
         """
         assert component_id, "Component id is required"
         assert component_name, "Component name is required"
-
-        if use_cache:
-            if component_id in constructed_views_cache:
-                component = constructed_views_cache[component_id]
-                component.setup(request)
-                component._validate_called = False
-                logger.debug(f"Retrieve {component_id} from constructed views cache")
-
-                return component
-
-        locations = []
 
         @timed
         def _get_component_class(
@@ -723,38 +666,53 @@ class UnicornView(TemplateView):
 
             return component_class
 
-        if "." in component_name:
-            # Handle fully-qualified component names (e.g. `project.unicorn.HelloWorldView`)
-            class_name = component_name.split(".")[-1:][0]
-            module_name = component_name.replace("." + class_name, "")
-            locations.append((class_name, module_name))
+        cache = caches[get_cache_alias()]
+        component_cache_key = f"unicorn:component:{component_id}"
+        cached_component = cache.get(component_cache_key)
 
-        # Handle component names that specify a folder structure
-        component_name = component_name.replace("/", ".")
+        if cached_component:
+            # Get the newest version of the parent from cache if it is available
+            # This needs to happen for Django cache because instances is pickled, so
+            # a change in the view won't be reflected automatically (like with the module
+            # cache) so it needs to be retrieved manually.
+            if cached_component.parent:
+                cached_parent_component = cache.get(
+                    cached_component.parent.component_cache_key
+                )
 
-        # Use conventions to find the component class
-        class_name = convert_to_camel_case(component_name)
+                if cached_parent_component:
+                    cached_component.parent = cached_parent_component
+                    cached_component.parent.setup(request)
+        else:
+            cached_component = constructed_views_cache.get(component_id)
 
-        if "." in class_name:
-            if class_name.split(".")[-1:]:
-                class_name = class_name.split(".")[-1:][0]
+        if use_cache and cached_component:
+            # Note that `hydrate()` and `complete` don't need to be called here
+            # because this path only happens for re-rendering from the view
+            cached_component.setup(request)
+            cached_component._validate_called = False
+            cached_component.calls = []
+            logger.debug(f"Retrieve {component_id} from constructed views cache")
 
-        class_name = f"{class_name}View"
-        module_name = convert_to_snake_case(component_name)
+            return cached_component
 
-        unicorn_apps = get_setting("APPS", ["unicorn"])
+        if component_id in views_cache:
+            (component_class, parent, kwargs) = views_cache[component_id]
 
-        assert (
-            isinstance(unicorn_apps, list)
-            or isinstance(unicorn_apps, tuple)
-            or isinstance(unicorn_apps, set)
-        ), "APPS is expected to be a list, tuple or set"
+            component = construct_component(
+                component_class=component_class,
+                component_id=component_id,
+                component_name=component_name,
+                component_key=component_key,
+                parent=parent,
+                request=request,
+                **kwargs,
+            )
+            logger.debug(f"Retrieve {component_id} from views cache")
 
-        for app in unicorn_apps:
-            app_module_name = f"{app}.components.{module_name}"
-            locations.append((class_name, app_module_name))
+            return component
 
-        # TODO: django.conf setting bool that defines whether to look in all installed apps for components
+        locations = get_locations(component_name)
 
         # Store the last exception that got raised while looking for a component in case it is useful context
         last_exception: Union[
@@ -764,7 +722,8 @@ class UnicornView(TemplateView):
         for (class_name, module_name) in locations:
             try:
                 component_class = _get_component_class(module_name, class_name)
-                component = component_class(
+                component = construct_component(
+                    component_class=component_class,
                     component_id=component_id,
                     component_name=component_name,
                     component_key=component_key,
@@ -773,15 +732,24 @@ class UnicornView(TemplateView):
                     **kwargs,
                 )
 
-                component.children = []
-                component._children_set = False
+                # Put the component's class in a module cache to skip looking for the component again
+                views_cache[component_id] = (component_class, parent, kwargs)
 
-                component.mount()
-                component.hydrate()
-                component._validate_called = False
+                # Put the instantiated component into a module cache and the Django cache
+                cacheable_component = None
 
-                # Put the component in a "cache" to skip looking for the component on the next request
-                constructed_views_cache[component_id] = component
+                try:
+                    cacheable_component = get_cacheable_component(component)
+                except UnicornCacheError as e:
+                    logger.warning(e)
+
+                if cacheable_component:
+                    if COMPONENTS_MODULE_CACHE_ENABLED:
+                        constructed_views_cache[component_id] = cacheable_component
+
+                    cache.set(
+                        cacheable_component.component_cache_key, cacheable_component
+                    )
 
                 return component
             except ModuleNotFoundError as e:

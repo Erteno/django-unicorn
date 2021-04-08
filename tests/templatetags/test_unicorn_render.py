@@ -1,7 +1,10 @@
+import re
+
 from django.template.base import Token, TokenType
 
 from django_unicorn.components import UnicornView
 from django_unicorn.templatetags.unicorn import unicorn
+from django_unicorn.utils import generate_checksum
 from example.coffee.models import Flavor
 
 
@@ -25,6 +28,20 @@ class FakeComponentModel(UnicornView):
     def __init__(self, *args, **kwargs):
         super().__init__(**kwargs)
         self.model_id = kwargs.get("model_id")
+
+
+class FakeComponentCalls(UnicornView):
+    template_name = "templates/test_component_parent.html"
+
+    def mount(self):
+        self.call("testCall")
+
+
+class FakeComponentCalls2(UnicornView):
+    template_name = "templates/test_component_parent.html"
+
+    def mount(self):
+        self.call("testCall2", "hello")
 
 
 def test_unicorn_render_kwarg():
@@ -175,3 +192,111 @@ def test_unicorn_render_id_use_pk():
     actual = unicorn_node.render(context)
 
     assert "==123==" in actual
+
+
+def test_unicorn_render_component_one_script_tag(settings):
+    settings.DEBUG = True
+    token = Token(
+        TokenType.TEXT,
+        "unicorn 'tests.templatetags.test_unicorn_render.FakeComponentKwargs'",
+    )
+    unicorn_node = unicorn(None, token)
+    context = {}
+    html = unicorn_node.render(context)
+
+    assert "<script" in html
+    assert len(re.findall("<script", html)) == 1
+
+
+def test_unicorn_render_child_component_no_script_tag(settings):
+    settings.DEBUG = True
+    token = Token(
+        TokenType.TEXT,
+        "unicorn 'tests.templatetags.test_unicorn_render.FakeComponentKwargs' parent=view",
+    )
+    unicorn_node = unicorn(None, token)
+    view = FakeComponentParent(component_name="test", component_id="asdf")
+    context = {"view": view}
+    html = unicorn_node.render(context)
+
+    assert "<script" not in html
+
+
+def test_unicorn_render_parent_component_one_script_tag(settings):
+    settings.DEBUG = True
+    token = Token(
+        TokenType.TEXT,
+        "unicorn 'tests.templatetags.test_unicorn_render.FakeComponentParent'",
+    )
+    unicorn_node = unicorn(None, token)
+    context = {}
+    html = unicorn_node.render(context)
+
+    assert "<script" in html
+    assert len(re.findall("<script", html)) == 1
+
+
+def test_unicorn_render_calls(settings):
+    settings.DEBUG = True
+    token = Token(
+        TokenType.TEXT,
+        "unicorn 'tests.templatetags.test_unicorn_render.FakeComponentCalls'",
+    )
+    unicorn_node = unicorn(None, token)
+    context = {}
+    html = unicorn_node.render(context)
+
+    assert "<script" in html
+    assert len(re.findall("<script", html)) == 1
+    assert '"calls":[{"fn":"testCall","args":[]}]' in html
+
+
+def test_unicorn_render_calls_with_arg(settings):
+    settings.DEBUG = True
+    token = Token(
+        TokenType.TEXT,
+        "unicorn 'tests.templatetags.test_unicorn_render.FakeComponentCalls2'",
+    )
+    unicorn_node = unicorn(None, token)
+    context = {}
+    html = unicorn_node.render(context)
+
+    assert "<script" in html
+    assert len(re.findall("<script", html)) == 1
+    assert '"calls":[{"fn":"testCall2","args":["hello"]}]' in html
+
+
+def test_unicorn_render_calls_no_mount_call(settings):
+    settings.DEBUG = True
+    token = Token(
+        TokenType.TEXT,
+        "unicorn 'tests.templatetags.test_unicorn_render.FakeComponentParent'",
+    )
+    unicorn_node = unicorn(None, token)
+    context = {}
+    html = unicorn_node.render(context)
+
+    assert "<script" in html
+    assert len(re.findall("<script", html)) == 1
+    assert '"calls":[]' in html
+
+
+def test_unicorn_render_hash(settings):
+    settings.DEBUG = True
+    token = Token(
+        TokenType.TEXT,
+        "unicorn 'tests.templatetags.test_unicorn_render.FakeComponentParent'",
+    )
+    unicorn_node = unicorn(None, token)
+    context = {}
+    html = unicorn_node.render(context)
+
+    assert "<script" in html
+    assert len(re.findall("<script", html)) == 1
+    assert '"hash":"' in html
+
+    # Assert that the content hash is correct
+    script_idx = html.index("<script")
+    rendered_content = html[:script_idx]
+    expected_hash = generate_checksum(rendered_content)
+    assert f'"hash":"{expected_hash}"' in html
