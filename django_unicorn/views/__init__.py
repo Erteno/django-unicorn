@@ -450,3 +450,10 @@ def message(request: HttpRequest, component_name: str = None) -> JsonResponse:
     json_result = _handle_component_request(request, component_request)
 
     return JsonResponse(json_result)
+
+
+
+async def message_async(
+    request: HttpRequest, component_name: str = None
+) -> JsonResponse:
+    return message(request, component_name)
